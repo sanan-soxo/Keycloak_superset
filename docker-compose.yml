@@ -1,0 +1,184 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.
+#
+
+x-superset-user: &superset-user root
+
+x-superset-volumes: &superset-volumes
+  - ./docker:/app/docker
+  - ./superset:/app/superset
+  - ./superset-frontend:/app/superset-frontend
+  - superset_home:/app/superset_home
+  - ./tests:/app/tests
+
+x-common-build: &common-build
+  context: .
+  target: ${SUPERSET_BUILD_TARGET:-dev}
+  cache_from:
+    - apache/superset-cache:3.10-slim-bookworm
+  args:
+    DEV_MODE: "true"
+    INCLUDE_CHROMIUM: ${INCLUDE_CHROMIUM:-false}
+    INCLUDE_FIREFOX: ${INCLUDE_FIREFOX:-false}
+    BUILD_TRANSLATIONS: ${BUILD_TRANSLATIONS:-false}
+    REQUIREMENTS_LOCAL: docker/requirements-local.txt
+
+
+services:
+  # ---------------------------------------------------------
+  # NGINX
+  # ---------------------------------------------------------
+  nginx:
+    image: nginx:latest
+    container_name: superset_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  # ---------------------------------------------------------
+  # REDIS
+  # ---------------------------------------------------------
+  redis:
+    image: redis:7
+    container_name: superset_cache
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis:/data
+
+  # ---------------------------------------------------------
+  # SUPERSET METADATA DB
+  # ---------------------------------------------------------
+  db:
+    image: postgres:15
+    container_name: superset_db
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db_home:/var/lib/postgresql/data
+      - ./docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+
+  # ---------------------------------------------------------
+  # KEYCLOAK DB
+  # ---------------------------------------------------------
+  keycloak-db:
+    image: postgres:15
+    container_name: keycloak_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - keycloak_db:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------
+  # KEYCLOAK
+  # ---------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: keycloak
+    command:
+      - start-dev
+      - --http-port=8080
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: keycloak-db
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    depends_on:
+      - keycloak-db
+
+  # ---------------------------------------------------------
+  # SUPERSET APP
+  # ---------------------------------------------------------
+  superset:
+    build:
+      <<: *common-build
+    container_name: superset_app
+    command: ["/app/docker/docker-bootstrap.sh", "app"]
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    env_file:
+      - docker/.env
+    environment:
+      SUPERSET_LOG_LEVEL: info
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      KEYCLOAK_CLIENT_SECRET: 17ZigzjkWyy6oWpVfGgY5rIzsfijBh8Q
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    user: *superset-user
+    volumes: *superset-volumes
+
+  # ---------------------------------------------------------
+  # SUPERSET INIT
+  # ---------------------------------------------------------
+  superset-init:
+    build:
+      <<: *common-build
+    container_name: superset_init
+    command: ["/app/docker/docker-init.sh"]
+    env_file:
+      - docker/.env
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+    user: *superset-user
+    volumes: *superset-volumes
+
+  # ---------------------------------------------------------
+  # SUPERSET WORKER
+  # ---------------------------------------------------------
+  superset-worker:
+    build:
+      <<: *common-build
+    container_name: superset_worker
+    command: ["/app/docker/docker-bootstrap.sh", "worker"]
+    env_file:
+      - docker/.env
+    environment:
+      CELERYD_CONCURRENCY: 2
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    user: *superset-user
+    volumes: *superset-volumes
+
+  # ---------------------------------------------------------
+  # SUPERSET BEAT
+  # ---------------------------------------------------------
+  superset-worker-beat:
+    build:
+      <<: *common-build
+    container_name: superset_worker_beat
+    command: ["/app/docker/docker-bootstrap.sh", "beat"]
+    env_file:
+      - docker/.env
+    depends_on:
+      - superset-worker
+    user: *superset-user
+    volumes: *superset-volumes
+
+volumes:
+  superset_home:
+  db_home:
+  redis:
+  keycloak_db:
